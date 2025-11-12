@@ -1,6 +1,6 @@
-# Realistic Auth Simulation (`final.cpp`)
+# Verbose System Analysis (`verbose.cpp`)
 
-This project simulates a distributed authentication protocol using AES encryption, mimicking real-world LAN or IoT environments with configurable delays, failures, and concurrency. It is designed to help you benchmark and analyze the performance and reliability of a token-based authentication system under various simulated network and hardware conditions.
+This project simulates verbose, a distributed authentication protocol using AES encryption, mimicking real-world LAN or IoT environments with configurable delays, failures, and concurrency. It is designed to help you benchmark and analyze the performance and reliability of a token-based authentication system under various simulated network and hardware conditions.
 
 ---
 
