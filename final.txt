@@ -1,0 +1,13 @@
+Performance Summary Report
+Generated: 2025-11-12 13:58:16
+-----------------------------------------
+Nodes: 100
+Workers: 2
+Average Time Per Node: 68.406 ms
+Minimum Time Observed: 32.026 ms
+Maximum Time Observed: 104.118 ms
+Median Time Per Node: 68.867 ms
+Success Percentage: 100.00 %
+Dropped Percentage: 0.00 %
+Run Wall Time: 3.455371 s
+-----------------------------------------
