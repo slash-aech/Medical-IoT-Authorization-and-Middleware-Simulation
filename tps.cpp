@@ -1,7 +1,7 @@
 // realistic_auth_sim.cpp
-// Compile: g++ -std=c++17 verbose.cpp -lcryptopp -O2 -pthread -o verbose
-// run using ./verbose
-// listing all the optional params -> ./verbose --nodes 200 --workers 4 --tamper-percent 1 --payload-bytes 512 --node-jitter 100 --net-ta-node 10 50 --net-node-mw 10 50 --db-delay 20 60 --fail-percent 3 --out results.csv
+// Compile: g++ -std=c++17 tps.cpp -lcryptopp -O2 -pthread -o tps
+// run using ./tps
+// listing all the optional params -> ./tps --nodes 200 --workers 4 --tamper-percent 1 --payload-bytes 512 --node-jitter 100 --net-ta-node 10 50 --net-node-mw 10 50 --db-delay 20 60 --fail-percent 3 --out results.csv
 
 #include <iostream>
 #include <fstream>
@@ -390,10 +390,10 @@ int main(int argc, char** argv) {
 
     // append_perf_csv(cfg.nodes, workers, avg_total, min_total, max_total, med_total, success_pct, drop_pct, run_total_s, cfg.out_file);
 
-    // Write human-readable summary to final.txt
-    write_summary_txt(cfg.nodes, workers, avg_total, min_total, max_total, med_total, success_pct, drop_pct, run_total_s, "final.txt");
+    // Write human-readable summary to tps.txt
+    write_summary_txt(cfg.nodes, workers, avg_total, min_total, max_total, med_total, success_pct, drop_pct, run_total_s, "tps.txt");
 
     cout << "Done. Avg node time: " << (avg_total/1000.0) << " ms, Success: " << success_pct << "%, Dropped: " << drop_pct << "%, Wall time: " << run_total_s << " s\n";
-    cout << "Results written to: " << cfg.out_file << " and final.txt" << endl;
+    cout << "Results written to: " << cfg.out_file << " and tps.txt" << endl;
     return 0;
 }
