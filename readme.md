@@ -1,6 +1,6 @@
-# Verbose System Analysis (`verbose.cpp`)
+# Three Point System Analysis (`tps.cpp`)
 
-This project simulates verbose, a distributed authentication protocol using AES encryption, mimicking real-world LAN or IoT environments with configurable delays, failures, and concurrency. It is designed to help you benchmark and analyze the performance and reliability of a token-based authentication system under various simulated network and hardware conditions.
+This project simulates tps, a distributed authentication protocol using AES encryption, mimicking real-world LAN or IoT environments with configurable delays, failures, and concurrency. It is designed to help you benchmark and analyze the performance and reliability of a token-based authentication system under various simulated network and hardware conditions.
 
 ---
 
@@ -21,7 +21,7 @@ This project simulates verbose, a distributed authentication protocol using AES 
 Requires [Crypto++](https://www.cryptopp.com/) and a C++17 compiler.
 
 ```sh
-g++ -std=c++17 final.cpp -lcryptopp -O2 -pthread -o verbose
+g++ -std=c++17 final.cpp -lcryptopp -O2 -pthread -o tps
 ```
 
 ---
@@ -31,13 +31,13 @@ g++ -std=c++17 final.cpp -lcryptopp -O2 -pthread -o verbose
 Run the simulation with default parameters:
 
 ```sh
-./verbose
+./tps
 ```
 
 Or customize with command-line options:
 
 ```sh
-./verbose --nodes 200 --workers 4 --tamper-percent 1 --payload-bytes 512 --node-jitter 100 --net-ta-node 10 50 --net-node-mw 10 50 --db-delay 20 60 --fail-percent 3 --out results.csv
+./tps --nodes 200 --workers 4 --tamper-percent 1 --payload-bytes 512 --node-jitter 100 --net-ta-node 10 50 --net-node-mw 10 50 --db-delay 20 60 --fail-percent 3 --out results.csv
 ```
 
 ### **Command-Line Parameters**
