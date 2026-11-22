@@ -1,94 +1,132 @@
-# Three Point System Analysis (`tps.cpp`)
+# Three-Party Medical IoT Authentication and Middleware Simulation
 
-This project simulates tps, a distributed authentication protocol using AES encryption, mimicking real-world LAN or IoT environments with configurable delays, failures, and concurrency. It is designed to help you benchmark and analyze the performance and reliability of a token-based authentication system under various simulated network and hardware conditions.
-Find the paper [here](https://ieeexplore.ieee.org/document/11507167)
+A C++17 simulation of a medical-IoT authentication protocol with three logical entities:
 
----
+1. **Trusted Authority (TA):** enrolls devices, verifies device possession proofs, issues signed access tokens, and derives versioned session keys.
+2. **IoT Node:** proves possession of its enrolled device secret, obtains a short-lived token, encrypts its medical-data payload, and sends the authenticated request.
+3. **Middleware (MW):** validates the token, timestamps, key version, replay state, and AES-GCM authentication tag before accepting a payload.
 
-## Features
+The implementation retains the original project's configurable network delays, database delay, node jitter, concurrent workers, random network drops, and performance summaries. It replaces the original unauthenticated AES-CBC message protection and hard-coded keys with an authenticated protocol.
 
-- **AES-CBC encryption** for all protocol steps (TA→Node, Node→Middleware, TA→Middleware).
-- **Token granting and validation** between Trusted Authority (TA), Node, and Middleware.
-- **Configurable network, database, and node delays** to simulate real-world conditions.
-- **Random request drops** to mimic unreliable networks.
-- **Multi-threaded simulation** with adjustable worker count (to mimic weak or strong CPUs).
-- **Tampering simulation** to test protocol robustness.
-- **Human-readable summary output** (`final.txt`) and optional CSV output.
+> **Hardware-authentication limitation:** the included `SecureElement` is a software-emulated backend. It demonstrates the API and challenge-response flow, but it is not a physical TPM, secure element, PUF, or hardware-rooted identity. See `REPORT.md` before describing this feature in a project paper.
 
----
+## Security features
 
-## Build Instructions
+- Device enrollment with a unique random 256-bit per-device secret.
+- Fresh random challenge and HMAC-SHA-256 proof-of-possession check.
+- Short-lived TA-issued access tokens authenticated with HMAC-SHA-256.
+- AES-256-GCM authenticated encryption for the data payload.
+- HKDF-style, domain-separated session-key derivation from a per-device secret and key version.
+- Key-version changes on a configurable time interval **and** after a configurable number of messages per device.
+- A bounded previous-time-version grace period for requests in flight during rotation.
+- Strict timestamp checks with configurable maximum clock skew.
+- Per-device increasing sequence numbers and a TTL-pruned nonce cache for replay rejection.
+- Atomic replay-state updates under a mutex; replay state is committed only after cryptographic checks pass.
+- Attack simulation switches for ciphertext tampering, replay, invalid device proof, expired tokens, and network drops.
+- CSV and human-readable performance summaries.
 
-Requires [Crypto++](https://www.cryptopp.com/) and a C++17 compiler.
+## Requirements
 
-```sh
-g++ -std=c++17 final.cpp -lcryptopp -O2 -pthread -o tps
+- C++17 compiler (GCC 9+, Clang 10+, or a compatible compiler)
+- OpenSSL development headers and `libcrypto`
+- POSIX-like environment for `localtime_r` (Linux/macOS/WSL)
+
+### Ubuntu / Debian
+
+```bash
+sudo apt update
+sudo apt install g++ libssl-dev
 ```
 
----
+### Build
 
-## Usage
-
-Run the simulation with default parameters:
-
-```sh
-./tps
+```bash
+make
 ```
 
-Or customize with command-line options:
+Or compile directly:
 
-```sh
-./tps --nodes 200 --workers 4 --tamper-percent 1 --payload-bytes 512 --node-jitter 100 --net-ta-node 10 50 --net-node-mw 10 50 --db-delay 20 60 --fail-percent 3 --out results.csv
+```bash
+g++ -std=c++17 -O2 -pthread tps.cpp -lcrypto -o tps
 ```
 
-### **Command-Line Parameters**
+A CMake build is also provided:
 
-| Parameter                | Description                                                      | Example Value(s)         |
-|--------------------------|------------------------------------------------------------------|--------------------------|
-| `--nodes N`              | Number of simulated nodes                                        | `--nodes 100`            |
-| `--workers N`            | Number of concurrent worker threads                              | `--workers 2`            |
-| `--tamper-percent P`     | Percentage of requests to tamper (simulate invalid tokens)       | `--tamper-percent 5`     |
-| `--payload-bytes N`      | Payload size per node (in bytes)                                 | `--payload-bytes 256`    |
-| `--node-jitter MS`       | Max jitter (ms) in node start times                             | `--node-jitter 50`       |
-| `--net-ta-node MIN MAX`  | Min and max network delay (ms) TA → Node                        | `--net-ta-node 5 20`     |
-| `--net-node-mw MIN MAX`  | Min and max network delay (ms) Node → Middleware                | `--net-node-mw 5 20`     |
-| `--db-delay MIN MAX`     | Min and max DB write/processing delay (ms)                      | `--db-delay 10 30`       |
-| `--fail-percent P`       | Percentage of requests to randomly drop/fail                    | `--fail-percent 2`       |
-| `--out filename`         | Output CSV file name                                             | `--out myresults.csv`    |
-| `--help` or `-h`         | Print usage/help message                                         | `--help`                 |
+```bash
+cmake -S . -B build
+cmake --build build -j
+```
 
----
+### Run a normal simulation
+
+```bash
+./tps --nodes 100 --workers 4
+```
+
+### Exercise the security checks
+
+```bash
+./tps \
+  --nodes 100 \
+  --workers 4 \
+  --messages-per-node 5 \
+  --tamper-percent 5 \
+  --replay-percent 5 \
+  --hardware-fail-percent 5 \
+  --expired-percent 5 \
+  --fail-percent 2
+```
+
+### Exercise message-count rotation
+
+```bash
+./tps --nodes 10 --workers 2 --messages-per-node 10 --rotate-after-messages 3
+```
+
+This changes the derived session-key version after every three messages from a device. Time-based rotation is controlled separately by `--rotation-seconds`.
+
+## Command-line options
+
+| Option | Default | Meaning |
+|---|---:|---|
+| `--nodes N` | 100 | Number of simulated IoT devices |
+| `--workers N` | 4 | Concurrent simulation workers |
+| `--messages-per-node N` | 1 | Sequential authenticated messages per device |
+| `--payload-bytes N` | 500 | Payload size for each message |
+| `--node-jitter MS` | 30 | Random node-start delay from 0 to MS |
+| `--net-ta-node MIN MAX` | 2 8 | Simulated TA-to-node delay in milliseconds |
+| `--net-node-mw MIN MAX` | 2 8 | Simulated node-to-MW delay in milliseconds |
+| `--db-delay MIN MAX` | 2 8 | Simulated database/processing delay in milliseconds |
+| `--max-clock-skew SEC` | 5 | Maximum permitted timestamp difference |
+| `--token-ttl SEC` | 60 | Lifetime of an access token |
+| `--replay-ttl SEC` | 120 | Nonce-cache retention interval |
+| `--rotation-seconds SEC` | 900 | Time-based key-rotation interval |
+| `--rotate-after-messages N` | 10000 | Rotate the per-device message key after N messages |
+| `--previous-key-grace SEC` | 30 | Grace period for a request using the immediately previous time-based key version |
+| `--tamper-percent P` | 0 | Probability of flipping a ciphertext bit after encryption |
+| `--replay-percent P` | 0 | Probability of redelivering an accepted request |
+| `--hardware-fail-percent P` | 0 | Probability of replacing the device proof with an invalid proof |
+| `--expired-percent P` | 0 | Probability of issuing an already-expired token |
+| `--fail-percent P` | 0 | Probability of simulating a dropped request before protocol processing |
+| `--out FILE` | `results.csv` | CSV output path |
+| `--summary FILE` | `tps.txt` | Human-readable summary path |
+| `--help`, `-h` | — | Print usage |
+
+Percentages must be between 0 and 100. Delay ranges must be non-negative and minimum must not exceed maximum. Numeric configuration values must be positive where applicable.
 
 ## Output
 
-- **final.txt**: Human-readable summary of each run (appends new results).
-- **CSV file** (default: `realistic_perf.csv`): Optional, compact per-run statistics (uncomment in code to enable).
+- `tps.txt`: appends a readable summary for every run, including latency and outcome counts.
+- `results.csv`: appends one row per run for spreadsheet analysis.
 
-Example summary in `final.txt`:
-```
-Performance Summary Report
-Generated: 2025-11-12 13:58:16
------------------------------------------
-Nodes: 100
-Workers: 2
-Average Time Per Node: 68.406 ms
-Minimum Time Observed: 32.026 ms
-Maximum Time Observed: 104.118 ms
-Median Time Per Node: 68.867 ms
-Success Percentage: 100.00 %
-Dropped Percentage: 0.00 %
-Run Wall Time: 3.455371 s
------------------------------------------
-```
+The latency includes the configured simulated waits and the protocol work performed in the simulation. It is not a measurement of a real medical device, physical secure element, production network, or database.
 
----
+## Protocol notes
 
-## Notes
+- Tokens are integrity-protected with HMAC-SHA-256. They are not encrypted; their fields are identifiers, timestamps, counters, key version, and a nonce, not medical payload data.
+- Payloads are protected using AES-256-GCM. A fresh random 96-bit nonce is generated for each encryption; the device ID, sequence number, timestamp, and key version are authenticated as associated data.
+- Session keys are derived separately for each device and key version from that device's enrolled secret. The TA token-signing key is generated randomly at process startup and is not persisted.
+- Replay state is in-memory and resets when the simulation process exits. A production deployment would need durable, shared replay state and a distributed atomic update strategy.
+- The program is a teaching/demo simulation, not a production medical security implementation.
 
-- **Simulated delays and drops** make results more realistic for LAN/IoT scenarios, but do not reflect actual hardware/network performance.
-- **Adjust parameters** to match your expected real-world environment (e.g., weak CPUs, slow networks, unreliable links).
-- **Crypto++** must be installed and linkable on your system.
-
----
-
-## License
+See [`REPORT.md`](REPORT.md) for the detailed architecture, message flows, diagrams, algorithms, threat analysis, assumptions, and evaluation plan.

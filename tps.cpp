@@ -1,399 +1,298 @@
-// realistic_auth_sim.cpp
-// Compile: g++ -std=c++17 tps.cpp -lcryptopp -O2 -pthread -o tps
-// run using ./tps
-// listing all the optional params -> ./tps --nodes 200 --workers 4 --tamper-percent 1 --payload-bytes 512 --node-jitter 100 --net-ta-node 10 50 --net-node-mw 10 50 --db-delay 20 60 --fail-percent 3 --out results.csv
+// Three-Party Medical IoT Authentication Simulation (improved protocol)
+// C++17 + OpenSSL 3.x (libcrypto)
+// Build: g++ -std=c++17 -O2 -pthread tps.cpp -lcrypto -o tps
+// This project is a protocol simulation. The default SecureElement backend is software-emulated.
 
-#include <iostream>
-#include <fstream>
-#include <string>
-#include <vector>
-#include <sstream>
-#include <iomanip>
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
+#include <openssl/rand.h>
+#include <openssl/crypto.h>
+
 #include <algorithm>
-#include <chrono>
-#include <thread>
-#include <mutex>
 #include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <cstdlib>
+#include <ctime>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <numeric>
 #include <random>
-#include <cstring>
-#include <cstdlib>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <vector>
 
-#include <cryptopp/aes.h>
-#include <cryptopp/modes.h>
-#include <cryptopp/filters.h>
-#include <cryptopp/hex.h>
-#include <cryptopp/osrng.h>
-#include <cryptopp/sha.h>
-#include <cryptopp/secblock.h>
-
+using Clock = std::chrono::steady_clock;
+using SysClock = std::chrono::system_clock;
+using Bytes = std::vector<unsigned char>;
 using std::string;
 using std::cout;
 using std::cerr;
 using std::endl;
-using CryptoPP::byte;
 
-// ---------- Helpers: hex encode/decode ----------
-string toHex(const string &input) {
-    std::string output;
-    CryptoPP::StringSource ss(input, true,
-        new CryptoPP::HexEncoder(new CryptoPP::StringSink(output), false));
-    return output;
+namespace crypto {
+Bytes randomBytes(size_t n) {
+    Bytes out(n);
+    if (RAND_bytes(out.data(), static_cast<int>(out.size())) != 1) throw std::runtime_error("RAND_bytes failed");
+    return out;
+}
+string hex(const Bytes& in) {
+    static const char* d = "0123456789abcdef";
+    string out; out.reserve(in.size() * 2);
+    for (unsigned char c : in) { out.push_back(d[c >> 4]); out.push_back(d[c & 15]); }
+    return out;
+}
+Bytes unhex(const string& s) {
+    if (s.size() % 2) throw std::runtime_error("Invalid hex string");
+    auto val=[](char c)->int { if(c>='0'&&c<='9') return c-'0'; if(c>='a'&&c<='f') return c-'a'+10; if(c>='A'&&c<='F') return c-'A'+10; return -1; };
+    Bytes out; out.reserve(s.size()/2);
+    for(size_t i=0;i<s.size();i+=2) { int a=val(s[i]), b=val(s[i+1]); if(a<0||b<0) throw std::runtime_error("Invalid hex string"); out.push_back(static_cast<unsigned char>((a<<4)|b)); }
+    return out;
+}
+Bytes hmac256(const Bytes& key, const string& msg) {
+    Bytes out(EVP_MAX_MD_SIZE); unsigned int len=0;
+    if(!HMAC(EVP_sha256(), key.data(), static_cast<int>(key.size()), reinterpret_cast<const unsigned char*>(msg.data()), msg.size(), out.data(), &len)) throw std::runtime_error("HMAC failed");
+    out.resize(len); return out;
+}
+Bytes sha256(const Bytes& in) {
+    Bytes out(32); unsigned int n=0;
+    if(EVP_Digest(in.data(), in.size(), out.data(), &n, EVP_sha256(), nullptr)!=1) throw std::runtime_error("SHA-256 failed");
+    out.resize(n); return out;
+}
+Bytes hkdfLike(const Bytes& master, const string& info) {
+    // HKDF-Extract/Expand with a fixed, domain-separated salt for this simulation.
+    Bytes salt(32, 0x5a);
+    Bytes prk=hmac256(salt, string(reinterpret_cast<const char*>(master.data()), master.size()));
+    Bytes t=hmac256(prk, info + string(1, '\x01'));
+    return t; // 32-byte AES-256 key
+}
+struct GcmBox { Bytes nonce, ciphertext, tag; };
+GcmBox encryptGcm(const Bytes& key, const string& plaintext, const string& aad) {
+    GcmBox box; box.nonce=randomBytes(12); box.ciphertext.resize(plaintext.size()+16); box.tag.resize(16);
+    EVP_CIPHER_CTX* raw=EVP_CIPHER_CTX_new(); if(!raw) throw std::runtime_error("EVP context allocation failed");
+    std::unique_ptr<EVP_CIPHER_CTX, decltype(&EVP_CIPHER_CTX_free)> ctx(raw, EVP_CIPHER_CTX_free);
+    int len=0, total=0;
+    if(EVP_EncryptInit_ex(ctx.get(), EVP_aes_256_gcm(), nullptr, nullptr, nullptr)!=1 ||
+       EVP_CIPHER_CTX_ctrl(ctx.get(), EVP_CTRL_GCM_SET_IVLEN, static_cast<int>(box.nonce.size()), nullptr)!=1 ||
+       EVP_EncryptInit_ex(ctx.get(), nullptr, nullptr, key.data(), box.nonce.data())!=1) throw std::runtime_error("GCM init failed");
+    if(!aad.empty() && EVP_EncryptUpdate(ctx.get(), nullptr, &len, reinterpret_cast<const unsigned char*>(aad.data()), static_cast<int>(aad.size()))!=1) throw std::runtime_error("GCM AAD failed");
+    if(!plaintext.empty() && EVP_EncryptUpdate(ctx.get(), box.ciphertext.data(), &len, reinterpret_cast<const unsigned char*>(plaintext.data()), static_cast<int>(plaintext.size()))!=1) throw std::runtime_error("GCM encrypt failed");
+    total=len;
+    if(EVP_EncryptFinal_ex(ctx.get(), box.ciphertext.data()+total, &len)!=1) throw std::runtime_error("GCM final failed");
+    total+=len; box.ciphertext.resize(total);
+    if(EVP_CIPHER_CTX_ctrl(ctx.get(), EVP_CTRL_GCM_GET_TAG, 16, box.tag.data())!=1) throw std::runtime_error("GCM tag failed");
+    return box;
+}
+string decryptGcm(const Bytes& key, const GcmBox& box, const string& aad) {
+    Bytes plain(box.ciphertext.size()+16); EVP_CIPHER_CTX* raw=EVP_CIPHER_CTX_new(); if(!raw) throw std::runtime_error("EVP context allocation failed");
+    std::unique_ptr<EVP_CIPHER_CTX, decltype(&EVP_CIPHER_CTX_free)> ctx(raw, EVP_CIPHER_CTX_free);
+    int len=0,total=0;
+    if(EVP_DecryptInit_ex(ctx.get(), EVP_aes_256_gcm(), nullptr, nullptr, nullptr)!=1 ||
+       EVP_CIPHER_CTX_ctrl(ctx.get(), EVP_CTRL_GCM_SET_IVLEN, static_cast<int>(box.nonce.size()), nullptr)!=1 ||
+       EVP_DecryptInit_ex(ctx.get(), nullptr, nullptr, key.data(), box.nonce.data())!=1) throw std::runtime_error("GCM init failed");
+    if(!aad.empty() && EVP_DecryptUpdate(ctx.get(), nullptr, &len, reinterpret_cast<const unsigned char*>(aad.data()), static_cast<int>(aad.size()))!=1) throw std::runtime_error("GCM AAD failed");
+    if(!box.ciphertext.empty() && EVP_DecryptUpdate(ctx.get(), plain.data(), &len, box.ciphertext.data(), static_cast<int>(box.ciphertext.size()))!=1) throw std::runtime_error("GCM decrypt failed");
+    total=len;
+    Bytes tag=box.tag;
+    if(EVP_CIPHER_CTX_ctrl(ctx.get(), EVP_CTRL_GCM_SET_TAG, static_cast<int>(tag.size()), tag.data())!=1) throw std::runtime_error("GCM set tag failed");
+    if(EVP_DecryptFinal_ex(ctx.get(), plain.data()+total, &len)!=1) throw std::runtime_error("Authentication tag verification failed");
+    total+=len; plain.resize(total); return string(plain.begin(), plain.end());
+}
 }
 
-string fromHex(const string &hex) {
-    std::string output;
-    CryptoPP::StringSource ss(hex, true,
-        new CryptoPP::HexDecoder(new CryptoPP::StringSink(output)));
-    return output;
-}
+static int64_t unixSeconds() { return std::chrono::duration_cast<std::chrono::seconds>(SysClock::now().time_since_epoch()).count(); }
+static string timestamp() { std::time_t t=std::time(nullptr); std::tm tm{}; localtime_r(&t,&tm); std::ostringstream o; o<<std::put_time(&tm,"%Y-%m-%d %H:%M:%S"); return o.str(); }
+static string joinFields(const std::vector<string>& v) { string s; for(size_t i=0;i<v.size();++i){if(i)s+='|';s+=v[i];} return s; }
+static std::vector<string> split(const string& s, char delim='|') { std::vector<string> v; std::stringstream ss(s); string x; while(std::getline(ss,x,delim))v.push_back(x); return v; }
 
-// ---------- Key derivation (SHA256 -> take first 16 bytes for AES-128) ----------
-CryptoPP::SecByteBlock deriveKey(const string &passphrase) {
-    byte digest[CryptoPP::SHA256::DIGESTSIZE];
-    CryptoPP::SHA256().CalculateDigest(digest, (const byte*)passphrase.data(), passphrase.size());
-    CryptoPP::SecByteBlock key(16);
-    std::copy(digest, digest + 16, key.begin());
-    return key;
-}
-
-// ---------- AES-CBC encrypt/decrypt with random IV ----------
-string aesEncryptHex(const CryptoPP::SecByteBlock &key, const string &plain) {
-    CryptoPP::AutoSeededRandomPool rng;
-    byte iv[CryptoPP::AES::BLOCKSIZE];
-    rng.GenerateBlock(iv, sizeof(iv));
-    std::string cipher;
-    CryptoPP::CBC_Mode<CryptoPP::AES>::Encryption enc;
-    enc.SetKeyWithIV(key, key.size(), iv);
-    CryptoPP::StringSource ss(plain, true,
-        new CryptoPP::StreamTransformationFilter(enc, new CryptoPP::StringSink(cipher))
-    );
-    string ivhex = toHex(string((const char*)iv, sizeof(iv)));
-    string chex  = toHex(cipher);
-    return ivhex + ":" + chex;
-}
-
-string aesDecryptHex(const CryptoPP::SecByteBlock &key, const string &combined) {
-    auto pos = combined.find(':');
-    if (pos == string::npos) throw std::runtime_error("Bad ciphertext format");
-    string ivhex = combined.substr(0, pos);
-    string chex  = combined.substr(pos + 1);
-    string iv = fromHex(ivhex);
-    string cipher = fromHex(chex);
-
-    std::string recovered;
-    CryptoPP::CBC_Mode<CryptoPP::AES>::Decryption dec;
-    dec.SetKeyWithIV(key, key.size(), (const byte*)iv.data());
-    CryptoPP::StringSource ss(cipher, true,
-        new CryptoPP::StreamTransformationFilter(dec, new CryptoPP::StringSink(recovered))
-    );
-    return recovered;
-}
-
-// ---------- Random token generator (hex string) ----------
-string genTokenHex(size_t bytes = 16) {
-    CryptoPP::AutoSeededRandomPool rng;
-    std::string raw(bytes, '\0');
-    rng.GenerateBlock((byte*)raw.data(), raw.size());
-    return toHex(raw);
-}
-
-// ---------- Simulated pre-shared keys & ids ----------
-const string NODE_ID_BASE = "node-";
-CryptoPP::SecByteBlock KEY_TA_NODE;
-CryptoPP::SecByteBlock KEY_NODE_MW;
-CryptoPP::SecByteBlock KEY_TA_MW;
-
-// ---------- TA issues per-request tokens (stateless helper) ----------
-struct IssuedTokens {
-    string token_plain;
-    string enc_for_node;
-    string enc_for_mw;
-};
-
-IssuedTokens TA_issue_tokens_for_node(const string &node_id) {
-    string token = genTokenHex(16);
-    string payload_for_node = "NODE_ID:" + node_id + ";TOKEN:" + token;
-    string payload_for_mw   = "MW_EXPECTS_NODE:" + node_id + ";TOKEN:" + token;
-    string enc_node = aesEncryptHex(KEY_TA_NODE, payload_for_node);
-    string enc_mw   = aesEncryptHex(KEY_TA_MW, payload_for_mw);
-    return { token, enc_node, enc_mw };
-}
-
-// ---------- Config ----------
 struct Config {
-    int nodes = 100;                  // Number of simulated nodes
-    int workers = 2;                  // Simulate weak CPU: only 2 concurrent threads
-    double tamper_percent = 0.0;      // No tampering unless you want to test it
-    int payload_bytes = 500;          // Typical small IoT/LAN message
-    int node_start_jitter_ms = 50;    // Small jitter in node start times
-    int net_delay_ta_node_min = 5, net_delay_ta_node_max = 20;    // LAN: low network delay (ms)
-    int net_delay_node_mw_min = 5, net_delay_node_mw_max = 20;    // LAN: low network delay (ms)
-    int db_delay_min = 10, db_delay_max = 30;                     // Simulate slow DB or processing (ms)
-    double fail_percent = 0.0;         // 2% simulated drop/failure rate
-    string out_file = "realistic_perf.csv";
+    int nodes=100, workers=4, payloadBytes=500, jitterMs=30, messagesPerNode=1;
+    int netTaNodeMin=2, netTaNodeMax=8, netNodeMwMin=2, netNodeMwMax=8, dbMin=2, dbMax=8;
+    double tamperPct=0, failPct=0, replayPct=0, hardwareFailPct=0, expiredPct=0;
+    int maxClockSkewSec=5, tokenTtlSec=60, replayTtlSec=120, rotationSeconds=900, rotateAfterMessages=10000, previousKeyGraceSec=30;
+    string csv="results.csv", summary="tps.txt";
 };
-bool parse_args(int argc, char** argv, Config &cfg) {
-    for (int i=1;i<argc;i++) {
-        string a = argv[i];
-        if (a=="--nodes" && i+1<argc) { cfg.nodes = std::stoi(argv[++i]); }
-        else if (a=="--workers" && i+1<argc) { cfg.workers = std::stoi(argv[++i]); }
-        else if (a=="--tamper-percent" && i+1<argc) { cfg.tamper_percent = std::stod(argv[++i]); }
-        else if (a=="--payload-bytes" && i+1<argc) { cfg.payload_bytes = std::stoi(argv[++i]); }
-        else if (a=="--node-jitter" && i+1<argc) { cfg.node_start_jitter_ms = std::stoi(argv[++i]); }
-        else if (a=="--net-ta-node" && i+2<argc) {
-            cfg.net_delay_ta_node_min = std::stoi(argv[++i]);
-            cfg.net_delay_ta_node_max = std::stoi(argv[++i]);
-        }
-        else if (a=="--net-node-mw" && i+2<argc) {
-            cfg.net_delay_node_mw_min = std::stoi(argv[++i]);
-            cfg.net_delay_node_mw_max = std::stoi(argv[++i]);
-        }
-        else if (a=="--db-delay" && i+2<argc) {
-            cfg.db_delay_min = std::stoi(argv[++i]);
-            cfg.db_delay_max = std::stoi(argv[++i]);
-        }
-        else if (a=="--fail-percent" && i+1<argc) { cfg.fail_percent = std::stod(argv[++i]); }
-        else if (a=="--out" && i+1<argc) { cfg.out_file = argv[++i]; }
-        else if (a=="--help" || a=="-h") {
-            return false;
-        } else {
-            cerr << "Unknown arg: " << a << "\n";
-            return false;
-        }
+bool parseArgs(int argc,char**argv,Config&c){
+    auto need=[&](int i,int n){return i+n<argc;};
+    for(int i=1;i<argc;++i){string a=argv[i];
+        if(a=="--help"||a=="-h")return false;
+        else if(a=="--nodes"&&need(i,1))c.nodes=std::stoi(argv[++i]);
+        else if(a=="--workers"&&need(i,1))c.workers=std::stoi(argv[++i]);
+        else if(a=="--payload-bytes"&&need(i,1))c.payloadBytes=std::stoi(argv[++i]);
+        else if(a=="--messages-per-node"&&need(i,1))c.messagesPerNode=std::stoi(argv[++i]);
+        else if(a=="--node-jitter"&&need(i,1))c.jitterMs=std::stoi(argv[++i]);
+        else if(a=="--net-ta-node"&&need(i,2)){c.netTaNodeMin=std::stoi(argv[++i]);c.netTaNodeMax=std::stoi(argv[++i]);}
+        else if(a=="--net-node-mw"&&need(i,2)){c.netNodeMwMin=std::stoi(argv[++i]);c.netNodeMwMax=std::stoi(argv[++i]);}
+        else if(a=="--db-delay"&&need(i,2)){c.dbMin=std::stoi(argv[++i]);c.dbMax=std::stoi(argv[++i]);}
+        else if(a=="--tamper-percent"&&need(i,1))c.tamperPct=std::stod(argv[++i]);
+        else if(a=="--fail-percent"&&need(i,1))c.failPct=std::stod(argv[++i]);
+        else if(a=="--replay-percent"&&need(i,1))c.replayPct=std::stod(argv[++i]);
+        else if(a=="--hardware-fail-percent"&&need(i,1))c.hardwareFailPct=std::stod(argv[++i]);
+        else if(a=="--expired-percent"&&need(i,1))c.expiredPct=std::stod(argv[++i]);
+        else if(a=="--max-clock-skew"&&need(i,1))c.maxClockSkewSec=std::stoi(argv[++i]);
+        else if(a=="--token-ttl"&&need(i,1))c.tokenTtlSec=std::stoi(argv[++i]);
+        else if(a=="--replay-ttl"&&need(i,1))c.replayTtlSec=std::stoi(argv[++i]);
+        else if(a=="--rotation-seconds"&&need(i,1))c.rotationSeconds=std::stoi(argv[++i]);
+        else if(a=="--rotate-after-messages"&&need(i,1))c.rotateAfterMessages=std::stoi(argv[++i]);
+        else if(a=="--previous-key-grace"&&need(i,1))c.previousKeyGraceSec=std::stoi(argv[++i]);
+        else if(a=="--out"&&need(i,1))c.csv=argv[++i];
+        else if(a=="--summary"&&need(i,1))c.summary=argv[++i];
+        else {cerr<<"Unknown or incomplete argument: "<<a<<"\n";return false;}
     }
-    if (cfg.nodes <= 0) cfg.nodes = 1000;
-    if (cfg.workers <= 0) cfg.workers = 1;
-    if (cfg.tamper_percent < 0) cfg.tamper_percent = 0;
-    if (cfg.tamper_percent > 100) cfg.tamper_percent = 100;
-    if (cfg.fail_percent < 0) cfg.fail_percent = 0;
-    if (cfg.fail_percent > 100) cfg.fail_percent = 100;
+    if(c.nodes<1||c.workers<1||c.payloadBytes<0||c.jitterMs<0||c.messagesPerNode<1||c.maxClockSkewSec<0||c.tokenTtlSec<1||c.replayTtlSec<1||c.rotationSeconds<1||c.rotateAfterMessages<1||c.previousKeyGraceSec<0) return false;
+    auto range=[](int a,int b){return a>=0&&b>=a;}; if(!range(c.netTaNodeMin,c.netTaNodeMax)||!range(c.netNodeMwMin,c.netNodeMwMax)||!range(c.dbMin,c.dbMax))return false;
+    for(double p:{c.tamperPct,c.failPct,c.replayPct,c.hardwareFailPct,c.expiredPct})if(p<0||p>100)return false;
     return true;
 }
+void usage(const char*p){cout<<"Usage: "<<p<<" [--nodes N] [--workers N] [--tamper-percent P] [--replay-percent P]\n"
+    <<"  [--hardware-fail-percent P] [--expired-percent P] [--fail-percent P] [--payload-bytes N] [--messages-per-node N]\n"
+    <<"  [--max-clock-skew SEC] [--token-ttl SEC] [--replay-ttl SEC] [--rotation-seconds SEC]\n"
+    <<"  [--rotate-after-messages N] [--previous-key-grace SEC] [--net-ta-node MIN MAX]\n"
+    <<"  [--net-node-mw MIN MAX] [--db-delay MIN MAX] [--node-jitter MS] [--out CSV] [--summary TXT]\n";}
 
-void print_usage(const char* prog) {
-    cout << "Usage: " << prog << " [--nodes N] [--workers N] [--tamper-percent P] [--payload-bytes N]\n";
-    cout << "       [--node-jitter MS] [--net-ta-node MIN MAX] [--net-node-mw MIN MAX] [--db-delay MIN MAX]\n";
-    cout << "       [--fail-percent P] [--out filename]\n";
-    cout << "Defaults: nodes=1000 workers=4 tamper-percent=0.0 payload-bytes=256 fail-percent=1.0\n";
-    cout << "Example: " << prog << " --nodes 1000 --workers 4 --tamper-percent 5 --payload-bytes 512 --fail-percent 2\n";
-}
-
-// ---------- Metrics ----------
-struct NodeMetrics {
-    int node_index;
-    long long total_us = 0;
-    bool success = false;
-    bool dropped = false;
+// Software-emulated secure element: private material is encapsulated behind this interface.
+// A physical implementation would replace this class with TPM2/SE driver calls.
+class SecureElement {
+    Bytes deviceSecret_;
+public:
+    explicit SecureElement(Bytes secret):deviceSecret_(std::move(secret)){}
+    Bytes provePossession(const string& challenge) const { return crypto::hmac256(deviceSecret_,challenge); }
+    Bytes deriveSessionKey(const string&id,uint64_t version) const { return crypto::hkdfLike(deviceSecret_,"medical-iot/session/"+id+"/"+std::to_string(version)); }
+};
+struct DeviceRecord { Bytes secret; };
+class TrustedAuthority {
+    Bytes tokenSigningKey_;
+    mutable std::mutex mutex_;
+    std::unordered_map<string,DeviceRecord> registry_;
+public:
+    TrustedAuthority():tokenSigningKey_(crypto::randomBytes(32)){}
+    string createChallenge() const { return crypto::hex(crypto::randomBytes(32)); }
+    Bytes enroll(const string&id) { Bytes secret=crypto::randomBytes(32); std::lock_guard<std::mutex>l(mutex_); registry_[id]={secret}; return secret; }
+    bool verifyProof(const string&id,const string&challenge,const Bytes&proof){std::lock_guard<std::mutex>l(mutex_);auto it=registry_.find(id);if(it==registry_.end())return false;Bytes expected=crypto::hmac256(it->second.secret,challenge);return expected.size()==proof.size()&&CRYPTO_memcmp(expected.data(),proof.data(),expected.size())==0;}
+    Bytes sessionKey(const string&id,uint64_t version)const{std::lock_guard<std::mutex>l(mutex_);auto it=registry_.find(id);if(it==registry_.end())throw std::runtime_error("Unknown device");return crypto::hkdfLike(it->second.secret,"medical-iot/session/"+id+"/"+std::to_string(version));}
+    string issueToken(const string&id,uint64_t seq,int64_t issued,int64_t expires,uint64_t version,const string&nonce){
+        string body=joinFields({id,std::to_string(seq),std::to_string(issued),std::to_string(expires),std::to_string(version),nonce});
+        Bytes sig=crypto::hmac256(tokenSigningKey_,body);return body+"|"+crypto::hex(sig);
+    }
+    bool verifyToken(const string&token,std::vector<string>&fields)const{
+        fields=split(token);if(fields.size()!=7)return false;string body=token.substr(0,token.rfind('|'));Bytes sig;
+        try{sig=crypto::unhex(fields[6]);}catch(...){return false;}Bytes expected=crypto::hmac256(tokenSigningKey_,body);
+        return sig.size()==expected.size()&&CRYPTO_memcmp(sig.data(),expected.data(),sig.size())==0;
+    }
 };
 
-long long median_of_vec(std::vector<long long> v) {
-    if (v.empty()) return 0;
-    std::sort(v.begin(), v.end());
-    size_t n = v.size();
-    return (n % 2 == 1) ? v[n/2] : ((v[n/2 - 1] + v[n/2]) / 2);
+class ReplayGuard {
+    struct State{uint64_t highestSeq=0;std::unordered_map<string,int64_t> nonces;};
+    std::mutex mutex_;std::unordered_map<string,State> state_;int64_t ttl_;
+public:
+    explicit ReplayGuard(int64_t ttl):ttl_(ttl){}
+    bool accept(const string&id,uint64_t seq,const string&nonce,int64_t now){std::lock_guard<std::mutex>l(mutex_);auto&s=state_[id];
+        for(auto it=s.nonces.begin();it!=s.nonces.end();)if(it->second<now-ttl_)it=s.nonces.erase(it);else ++it;
+        if(seq<=s.highestSeq||s.nonces.count(nonce)) return false;
+        s.highestSeq=seq; s.nonces[nonce]=now; return true; }
+};
+struct Request { string id,token;uint64_t seq=0,version=0;int64_t timestamp=0;string nonce;crypto::GcmBox box; };
+struct Metrics {int index=0;long long micros=0;bool success=false,dropped=false;string outcome="rejected";};
+static uint64_t makeKeyVersion(int64_t issued,uint64_t seq,const Config&cfg){
+    // High-order component rotates on wall-clock intervals; low-order component rotates every N messages/device.
+    return static_cast<uint64_t>(issued/cfg.rotationSeconds)*1000000000ULL + ((seq-1)/static_cast<uint64_t>(cfg.rotateAfterMessages));
 }
 
-// ---------- Worker ----------
-void worker_func(std::atomic<int> &counter, const Config &cfg, std::vector<NodeMetrics> &results, std::mutex &res_mutex, std::mt19937 &rng) {
-    std::uniform_int_distribution<int> jitter(0, cfg.node_start_jitter_ms);
-    std::uniform_int_distribution<int> net_ta_node(cfg.net_delay_ta_node_min, cfg.net_delay_ta_node_max);
-    std::uniform_int_distribution<int> net_node_mw(cfg.net_delay_node_mw_min, cfg.net_delay_node_mw_max);
-    std::uniform_int_distribution<int> db_delay(cfg.db_delay_min, cfg.db_delay_max);
-    std::uniform_real_distribution<double> tamper_unif(0.0, 1.0);
-    std::uniform_real_distribution<double> fail_unif(0.0, 1.0);
+class Middleware {
+    TrustedAuthority&ta_;ReplayGuard replay_;const Config&cfg_;
+public:
+    Middleware(TrustedAuthority&t,const Config&c):ta_(t),replay_(c.replayTtlSec),cfg_(c){}
+    bool process(const Request&r,string&reason){
+        std::vector<string> f;if(!ta_.verifyToken(r.token,f)){reason="invalid_token";return false;}
+        if(f[0]!=r.id){reason="identity_mismatch";return false;}
+        uint64_t seq=0,ver=0;int64_t issued=0,expires=0;try{seq=std::stoull(f[1]);issued=std::stoll(f[2]);expires=std::stoll(f[3]);ver=std::stoull(f[4]);}catch(...){reason="malformed_token";return false;}
+        int64_t now=unixSeconds();if(issued>now+cfg_.maxClockSkewSec||now-issued>cfg_.maxClockSkewSec){reason="stale_or_future_timestamp";return false;}
+        if(now>expires){reason="expired_token";return false;}if(seq!=r.seq||ver!=r.version||f[5]!=r.nonce){reason="request_token_mismatch";return false;}
+        // Strictly reject old/future request timestamps independently of token expiry.
+        if(std::llabs(now-r.timestamp)>cfg_.maxClockSkewSec){reason="request_timestamp_out_of_window";return false;}
+        uint64_t expectedVersion=makeKeyVersion(issued,seq,cfg_);
+        if(r.version!=expectedVersion){reason="key_version_mismatch";return false;}
+        int64_t issuedBucket=issued/cfg_.rotationSeconds, currentBucket=now/cfg_.rotationSeconds;
+        if(currentBucket>issuedBucket && now%cfg_.rotationSeconds>cfg_.previousKeyGraceSec){reason="key_rotation_grace_expired";return false;}
+        if(currentBucket-issuedBucket>1){reason="key_version_expired";return false;}
+        try{string aad=r.id+"|"+std::to_string(r.seq)+"|"+std::to_string(r.timestamp)+"|"+std::to_string(r.version);
+            string plaintext=crypto::decryptGcm(ta_.sessionKey(r.id,r.version),r.box,aad);if(plaintext.empty()&&cfg_.payloadBytes>0){reason="empty_payload";return false;}}
+        catch(...){reason="integrity_check_failed";return false;}
+        // Commit replay state only after token, time, key-version and AEAD checks succeed.
+        if(!replay_.accept(r.id,r.seq,r.nonce,now)){reason="replay_detected";return false;}
+        reason="accepted";return true;
+    }
+};
 
-    while (true) {
-        int idx = counter.fetch_add(1);
-        if (idx >= cfg.nodes) break;
-        NodeMetrics m{};
-        m.node_index = idx;
-        using clk = std::chrono::high_resolution_clock;
-        auto t_start = clk::now();
-
-        // Staggered node start
-        std::this_thread::sleep_for(std::chrono::milliseconds(jitter(rng)));
-
-        // Simulate network delay TA -> Node
-        std::this_thread::sleep_for(std::chrono::milliseconds(net_ta_node(rng)));
-
-        // Simulate random drop/failure
-        if (fail_unif(rng) < (cfg.fail_percent / 100.0)) {
-            m.dropped = true;
-            auto t_end = clk::now();
-            m.total_us = std::chrono::duration_cast<std::chrono::microseconds>(t_end - t_start).count();
-            std::lock_guard<std::mutex> lg(res_mutex);
-            results.push_back(std::move(m));
-            continue;
-        }
-
-        // TA issues token
-        IssuedTokens issued = TA_issue_tokens_for_node(NODE_ID_BASE + std::to_string(idx));
-
-        // Node decrypts
-        string decrypted_payload = aesDecryptHex(KEY_TA_NODE, issued.enc_for_node);
-        auto p_token = decrypted_payload.find("TOKEN:");
-        string token_extracted = (p_token != string::npos) ? decrypted_payload.substr(p_token + 6) : "";
-
-        // Maybe tamper
-        if (tamper_unif(rng) < (cfg.tamper_percent / 100.0)) {
-            token_extracted = genTokenHex(8);
-        }
-
-        // Build and encrypt to MW
-        string payload(cfg.payload_bytes, 'A' + (idx % 26));
-        string header = "NODE_ID:" + NODE_ID_BASE + std::to_string(idx) + ";TOKEN:" + token_extracted;
-        string full_request = "HEADER[" + header + "]|BODY[" + payload + "]";
-
-        // Simulate network delay Node -> MW
-        std::this_thread::sleep_for(std::chrono::milliseconds(net_node_mw(rng)));
-
-        string encrypted_for_mw = aesEncryptHex(KEY_NODE_MW, full_request);
-
-        // Middleware decrypt & validate
-        string ta_payload_for_mw = aesDecryptHex(KEY_TA_MW, issued.enc_for_mw);
-        string ta_token;
-        auto p = ta_payload_for_mw.find("TOKEN:");
-        if (p != string::npos) ta_token = ta_payload_for_mw.substr(p + 6);
-
-        string node_request_plain = aesDecryptHex(KEY_NODE_MW, encrypted_for_mw);
-
-        // parse header token
-        string header_marker = "HEADER[";
-        auto hpos = node_request_plain.find(header_marker);
-        if (hpos != string::npos) {
-            auto hend = node_request_plain.find("]", hpos + header_marker.size());
-            if (hend != string::npos) {
-                string header_str = node_request_plain.substr(hpos + header_marker.size(), hend - (hpos + header_marker.size()));
-                auto tpos = header_str.find("TOKEN:");
-                string node_token = (tpos != string::npos) ? header_str.substr(tpos + 6) : "";
-                m.success = (node_token == ta_token);
+static double randomPct(std::mt19937&r){return std::uniform_real_distribution<double>(0,100)(r);}
+void worker(std::atomic<int>&next,const Config&cfg,std::vector<Metrics>&out,std::mutex&outMutex,TrustedAuthority&ta,Middleware&mw,std::mt19937 rng){
+    std::uniform_int_distribution<int> jitter(0,cfg.jitterMs),d1(cfg.netTaNodeMin,cfg.netTaNodeMax),d2(cfg.netNodeMwMin,cfg.netNodeMwMax),db(cfg.dbMin,cfg.dbMax);
+    while(true){int idx=next.fetch_add(1);if(idx>=cfg.nodes)break;Metrics m;m.index=idx;auto start=Clock::now();
+        try{
+            std::this_thread::sleep_for(std::chrono::milliseconds(jitter(rng)));
+            std::this_thread::sleep_for(std::chrono::milliseconds(d1(rng)));
+            if(randomPct(rng)<cfg.failPct){m.dropped=true;m.outcome="network_drop";}
+            else{
+                string id="medical-node-"+std::to_string(idx);Bytes secret=ta.enroll(id);SecureElement se(secret);
+                string challenge=ta.createChallenge();Bytes proof=se.provePossession(challenge);
+                if(randomPct(rng)<cfg.hardwareFailPct)proof=crypto::randomBytes(32);
+                if(!ta.verifyProof(id,challenge,proof)){m.outcome="device_authentication_failed";}
+                else{
+                    m.success=true; m.outcome="accepted";
+                    for(int message=0;message<cfg.messagesPerNode;++message){
+                        int64_t now=unixSeconds();uint64_t seq=static_cast<uint64_t>(message)+1;
+                        uint64_t version=makeKeyVersion(now,seq,cfg);
+                        string nonce=crypto::hex(crypto::randomBytes(16));int64_t expires=now+cfg.tokenTtlSec;
+                        if(randomPct(rng)<cfg.expiredPct)expires=now-1;
+                        string token=ta.issueToken(id,seq,now,expires,version,nonce);
+                        string payload(static_cast<size_t>(cfg.payloadBytes),static_cast<char>('A'+idx%26));
+                        string aad=id+"|"+std::to_string(seq)+"|"+std::to_string(now)+"|"+std::to_string(version);
+                        Request req;req.id=id;req.seq=seq;req.version=version;req.timestamp=now;req.nonce=nonce;req.token=token;
+                        req.box=crypto::encryptGcm(se.deriveSessionKey(id,version),payload,aad);
+                        // Tamper after encryption so the receiver must detect a failed GCM tag.
+                        if(randomPct(rng)<cfg.tamperPct && !req.box.ciphertext.empty()) req.box.ciphertext[0] ^= 0x01;
+                        std::this_thread::sleep_for(std::chrono::milliseconds(d2(rng)));
+                        string reason;bool accepted=mw.process(req,reason);
+                        if(randomPct(rng)<cfg.replayPct && accepted){string replayReason;bool replayAccepted=mw.process(req,replayReason);if(replayAccepted){m.success=false;m.outcome="replay_accepted";}else if(m.outcome=="accepted")m.outcome="replay_rejected";}
+                        if(!accepted){m.success=false;m.outcome=reason;}
+                        std::this_thread::sleep_for(std::chrono::milliseconds(db(rng)));
+                        if(!m.success)break;
+                    }
+                }
             }
-        }
-
-        // Simulate DB write delay
-        std::this_thread::sleep_for(std::chrono::milliseconds(db_delay(rng)));
-
-        auto t_end = clk::now();
-        m.total_us = std::chrono::duration_cast<std::chrono::microseconds>(t_end - t_start).count();
-
-        std::lock_guard<std::mutex> lg(res_mutex);
-        results.push_back(std::move(m));
+        }catch(const std::exception&e){m.success=false;m.outcome=string("internal_error:")+e.what();}
+        m.micros=std::chrono::duration_cast<std::chrono::microseconds>(Clock::now()-start).count();
+        std::lock_guard<std::mutex>l(outMutex);out.push_back(std::move(m));
     }
 }
-
-// ---------- CSV + summary helpers ----------
-std::string currentTimestamp() {
-    auto now = std::chrono::system_clock::now();
-    std::time_t now_c = std::chrono::system_clock::to_time_t(now);
-    std::tm tm = *std::localtime(&now_c);
-    std::ostringstream oss;
-    oss << std::put_time(&tm, "%Y-%m-%d %H:%M:%S");
-    return oss.str();
-}
-
-void append_perf_csv(int nodes, int workers, long long avg_us, long long min_us, long long max_us, long long med_us, double success_pct, double drop_pct, double wall_time_s, const string &filename) {
-    bool newFile = false;
-    {
-        std::ifstream check(filename);
-        newFile = !check.good();
-    }
-    std::ofstream f(filename, std::ios::app);
-    if (!f.good()) {
-        cerr << "Failed to open perf CSV file: " << filename << "\n";
-        return;
-    }
-    if (newFile) {
-        f << "Timestamp,Nodes,Workers,Avg Total (us),Min (us),Max (us),Median (us),Success %,Dropped %,Wall Time (s)\n";
-    }
-    f << currentTimestamp() << "," << nodes << "," << workers << "," << avg_us << "," << min_us << "," << max_us << "," << med_us << ","
-      << std::fixed << std::setprecision(2) << success_pct << "," << drop_pct << "," << std::fixed << std::setprecision(6) << wall_time_s << "\n";
-    f.close();
-}
-void write_summary_txt(
-    int nodes, int workers, long long avg_us, long long min_us, long long max_us, long long med_us,
-    double success_pct, double drop_pct, double wall_time_s, const std::string& filename
-) {
-    std::ofstream fout(filename, std::ios::app);
-    if (!fout.good()) return;
-    fout << "Performance Summary Report\n";
-    fout << "Generated: " << currentTimestamp() << "\n";
-    fout << "-----------------------------------------\n";
-    fout << "Nodes: " << nodes << "\n";
-    fout << "Workers: " << workers << "\n";
-    fout << "Average Time Per Node: " << (avg_us/1000.0) << " ms\n";
-    fout << "Minimum Time Observed: " << (min_us/1000.0) << " ms\n";
-    fout << "Maximum Time Observed: " << (max_us/1000.0) << " ms\n";
-    fout << "Median Time Per Node: " << (med_us/1000.0) << " ms\n";
-    fout << "Success Percentage: " << std::fixed << std::setprecision(2) << success_pct << " %\n";
-    fout << "Dropped Percentage: " << std::fixed << std::setprecision(2) << drop_pct << " %\n";
-    fout << "Run Wall Time: " << std::fixed << std::setprecision(6) << wall_time_s << " s\n";
-    fout << "-----------------------------------------\n\n";
-    fout.close();
-}
-
-// ---------- Main ----------
-int main(int argc, char** argv) {
-    // derive keys
-    KEY_TA_NODE = deriveKey("passphrase_ta_node_v1");
-    KEY_NODE_MW = deriveKey("passphrase_node_mw_v1");
-    KEY_TA_MW   = deriveKey("passphrase_ta_mw_v1");
-
-    Config cfg;
-    if (!parse_args(argc, argv, cfg)) {
-        print_usage(argv[0]);
-        return 1;
-    }
-
-    cout << "Simulating " << cfg.nodes << " nodes with " << cfg.workers << " workers...\n";
-    cout << "Network delays: TA->Node " << cfg.net_delay_ta_node_min << "-" << cfg.net_delay_ta_node_max << "ms, "
-         << "Node->MW " << cfg.net_delay_node_mw_min << "-" << cfg.net_delay_node_mw_max << "ms, "
-         << "DB " << cfg.db_delay_min << "-" << cfg.db_delay_max << "ms\n";
-    cout << "Tamper %: " << cfg.tamper_percent << ", Drop %: " << cfg.fail_percent << ", Payload: " << cfg.payload_bytes << " bytes\n";
-
-    std::vector<NodeMetrics> results;
-    results.reserve(cfg.nodes);
-    std::mutex res_mutex;
-    std::atomic<int> counter{0};
-
-    auto run_start = std::chrono::high_resolution_clock::now();
-
-    // spawn workers
-    int workers = std::min(cfg.workers, cfg.nodes);
-    std::vector<std::thread> pool;
-    pool.reserve(workers);
-    std::random_device rd;
-    for (int i=0;i<workers;++i) {
-        std::mt19937 rng(rd() ^ (i * 7919));
-        pool.emplace_back(worker_func, std::ref(counter), std::ref(cfg), std::ref(results), std::ref(res_mutex), std::ref(rng));
-    }
-    for (auto &t : pool) if (t.joinable()) t.join();
-
-    auto run_end = std::chrono::high_resolution_clock::now();
-    double run_total_s = std::chrono::duration_cast<std::chrono::duration<double>>(run_end - run_start).count();
-
-    // compute aggregated stats
-    std::vector<long long> totals;
-    int success_cnt = 0, drop_cnt = 0;
-    for (const auto &m : results) {
-        if (m.dropped) ++drop_cnt;
-        else totals.push_back(m.total_us);
-        if (m.success) ++success_cnt;
-    }
-
-    long long avg_total = totals.empty() ? 0 : std::accumulate(totals.begin(), totals.end(), 0LL) / (long long)totals.size();
-    long long min_total = totals.empty() ? 0 : *std::min_element(totals.begin(), totals.end());
-    long long max_total = totals.empty() ? 0 : *std::max_element(totals.begin(), totals.end());
-    long long med_total = median_of_vec(totals);
-    double success_pct = results.empty() ? 0.0 : (100.0 * success_cnt / (double)cfg.nodes);
-    double drop_pct = results.empty() ? 0.0 : (100.0 * drop_cnt / (double)cfg.nodes);
-
-    // append_perf_csv(cfg.nodes, workers, avg_total, min_total, max_total, med_total, success_pct, drop_pct, run_total_s, cfg.out_file);
-
-    // Write human-readable summary to tps.txt
-    write_summary_txt(cfg.nodes, workers, avg_total, min_total, max_total, med_total, success_pct, drop_pct, run_total_s, "tps.txt");
-
-    cout << "Done. Avg node time: " << (avg_total/1000.0) << " ms, Success: " << success_pct << "%, Dropped: " << drop_pct << "%, Wall time: " << run_total_s << " s\n";
-    cout << "Results written to: " << cfg.out_file << " and tps.txt" << endl;
-    return 0;
+long long median(std::vector<long long>v){if(v.empty())return 0;std::sort(v.begin(),v.end());size_t n=v.size();return n%2?v[n/2]:(v[n/2-1]+v[n/2])/2;}
+int main(int argc,char**argv){Config cfg;if(!parseArgs(argc,argv,cfg)){usage(argv[0]);for(int i=1;i<argc;++i)if(string(argv[i])=="--help"||string(argv[i])=="-h")return 0;return 1;}
+    cout<<"Three-Party Medical IoT Authentication Simulation (improved protocol)\n"
+        <<"Nodes="<<cfg.nodes<<" Workers="<<cfg.workers<<" Messages/node="<<cfg.messagesPerNode<<" Payload="<<cfg.payloadBytes<<" bytes\n"
+        <<"Security: AES-256-GCM, HMAC-SHA256 tokens/device proof, HKDF-style session derivation\n"
+        <<"Clock skew="<<cfg.maxClockSkewSec<<"s Token TTL="<<cfg.tokenTtlSec<<"s Replay TTL="<<cfg.replayTtlSec<<"s Rotation="<<cfg.rotationSeconds<<"s\n"
+        <<"Secure Element backend: SOFTWARE EMULATION (not physical hardware)\n";
+    TrustedAuthority ta;Middleware mw(ta,cfg);std::atomic<int>next{0};std::mutex outMutex;std::vector<Metrics>results;results.reserve(cfg.nodes);
+    auto runStart=Clock::now();int nworkers=std::min(cfg.workers,cfg.nodes);std::vector<std::thread>pool;std::random_device rd;
+    for(int i=0;i<nworkers;++i)pool.emplace_back(worker,std::ref(next),std::cref(cfg),std::ref(results),std::ref(outMutex),std::ref(ta),std::ref(mw),std::mt19937(rd()^(i*7919)));
+    for(auto&t:pool) t.join();
+    double wall=std::chrono::duration<double>(Clock::now()-runStart).count();
+    std::vector<long long>times;int accepted=0,dropped=0;std::map<string,int>outcomes;
+    for(auto&m:results){if(!m.dropped)times.push_back(m.micros);else ++dropped;if(m.success)++accepted;++outcomes[m.outcome];}
+    long long avg=times.empty()?0:std::accumulate(times.begin(),times.end(),0LL)/times.size(),mn=times.empty()?0:*std::min_element(times.begin(),times.end()),mx=times.empty()?0:*std::max_element(times.begin(),times.end()),med=median(times);
+    double successPct=100.0*accepted/cfg.nodes,dropPct=100.0*dropped/cfg.nodes;
+    std::ofstream s(cfg.summary,std::ios::app);s<<"\nImproved Three-Party Protocol Summary\nGenerated: "<<timestamp()<<"\nNodes: "<<cfg.nodes<<"\nWorkers: "<<nworkers<<"\nAccepted requests: "<<accepted<<"\nSuccess percentage: "<<std::fixed<<std::setprecision(2)<<successPct<<"%\nNetwork drops: "<<dropped<<" ("<<dropPct<<"%)\nAverage latency: "<<avg/1000.0<<" ms\nMedian latency: "<<med/1000.0<<" ms\nMin/Max latency: "<<mn/1000.0<<" / "<<mx/1000.0<<" ms\nWall time: "<<wall<<" s\nOutcome counts:\n";for(auto&x:outcomes)s<<"  "<<x.first<<": "<<x.second<<"\n";s<<"----------------------------------------\n";
+    bool fresh=!std::ifstream(cfg.csv).good();std::ofstream csv(cfg.csv,std::ios::app);if(fresh)csv<<"timestamp,nodes,workers,accepted,success_pct,dropped,drop_pct,avg_us,median_us,min_us,max_us,wall_seconds\n";
+    csv<<'"'<<timestamp()<<"\","<<cfg.nodes<<','<<nworkers<<','<<accepted<<','<<successPct<<','<<dropped<<','<<dropPct<<','<<avg<<','<<med<<','<<mn<<','<<mx<<','<<wall<<"\n";
+    cout<<"\nRun complete. Accepted="<<accepted<<" ("<<successPct<<"%), dropped="<<dropped<<" ("<<dropPct<<"%).\n"
+        <<"Average latency="<<avg/1000.0<<" ms; median="<<med/1000.0<<" ms; wall="<<wall<<" s\n"
+        <<"Detailed outcomes:\n";for(auto&x:outcomes)cout<<"  "<<x.first<<": "<<x.second<<"\n";
+    cout<<"Summary: "<<cfg.summary<<"\nCSV: "<<cfg.csv<<"\n";return 0;
 }
